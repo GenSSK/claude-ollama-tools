@@ -6,7 +6,7 @@
 - **`ollama-manager`** — Ollama モデルを管理する TUI（一覧 / ダウンロード / 削除 / context 長変更 / unload / 詳細）。
 
 > [!WARNING]
-> ローカルモデルでの Claude Code は、本家 Anthropic モデルより明確に不安定です。Claude Code は徹底的にツール（関数呼び出し）を使うため、**ツール対応が強いモデル**（例: `qwen2.5-coder`, `qwen3`, `devstral`）を推奨します。小型モデルはツール呼び出しの形式を守れずエラーになりがちです。
+> ローカルモデルでの Claude Code は、本家 Anthropic モデルより明確に不安定です。Claude Code は徹底的にツール（関数呼び出し）を使うため、**ツール対応が強いモデル**（例: `qwen3.6`, `gemma4`, `devstral`）を推奨します。小型モデルはツール呼び出しの形式を守れずエラーになりがちです。
 
 ## 必要なもの
 
@@ -16,7 +16,7 @@
 | [Ollama](https://ollama.com) | **公式アプリ版を推奨**。Homebrew の formula 版はランナー `llama-server` を欠き推論できない場合があります（`brew install --cask ollama`） |
 | [Claude Code](https://claude.com/claude-code) | `claude` コマンド |
 | [uv](https://docs.astral.sh/uv/) | `ollama-manager` の実行に必要（依存は初回に自動取得） |
-| zsh | `localclaude` の実行に必要 |
+
 
 `localclaude` は Ollama のネイティブ Anthropic 互換エンドポイント（`/v1/messages`）を自動判定して直結します。無い場合は [LiteLLM](https://github.com/BerriAI/litellm) にフォールバックします（要 `litellm`）。
 
@@ -25,11 +25,18 @@
 ```sh
 git clone https://github.com/GenSSK/claude-ollama-tools.git
 cd claude-ollama-tools
-
-# PATH の通ったディレクトリにシンボリックリンク（例）
-ln -s "$PWD/bin/localclaude"    ~/.local/bin/localclaude
-ln -s "$PWD/bin/ollama-manager" ~/.local/bin/ollama-manager
+./install.sh                          # 既定 ~/.local/bin に symlink（uv が無ければ導入を確認）
 ```
+
+インストール先・方法は指定できます:
+
+```sh
+./install.sh --bin-dir /usr/local/bin   # インストール先を変更
+./install.sh --copy                     # symlink ではなくコピー
+./uninstall.sh                          # アンインストール（--bin-dir / --purge 可）
+```
+
+`install.sh` は PATH 未通知の警告、`ollama` / `claude` の有無チェックも行い、`uv`（`ollama-manager` に必要）が無ければインストールするか尋ねます。
 
 Ollama を常時起動にしておくと快適です（公式アプリの設定 → "Launch at login"）。
 
@@ -57,11 +64,11 @@ localclaude [-m|--model <name>] [-l|--list] [--keep] [--host <url>] \
 `--model` を省略すると、インストール済みモデルから選択します。
 
 ```sh
-localclaude                          # モデルを選択して起動
-localclaude -m qwen3:30b             # モデル指定
-localclaude -- -c                    # claude を --continue で起動
-localclaude -m qwen3:30b -- -p "fix" # 非対話実行
-localclaude --host 192.168.2.31      # 別マシン(LAN)の Ollama を使う
+localclaude                            # モデルを選択して起動
+localclaude -m qwen3.6:35b             # モデル指定
+localclaude -- -c                      # claude を --continue で起動
+localclaude -m qwen3.6:35b -- -p "fix" # 非対話実行
+localclaude --host 192.168.2.31        # 別マシン(LAN)の Ollama を使う
 ```
 
 ### 動作
