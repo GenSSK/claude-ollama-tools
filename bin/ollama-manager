@@ -10,7 +10,7 @@ ollama-manager — Ollama モデル管理 TUI
     - 一覧（サイズ / 現在の context長 / ロード状態）
     - pull（ダウンロード進捗バー）
     - 削除
-    - num_ctx を変えた派生モデルの作成（<base>-ctx<N>）  ← localclaude と命名規約を共有
+    - num_ctx を変えた派生モデルの作成（k/m 入力可・保存名指定可、既定 <base>-<ctx>）
     - ロード中モデルの unload
     - 詳細表示（ollama show 相当）
 
@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 
 import httpx
@@ -122,18 +123,29 @@ def build_show_body(name: str, show: dict) -> str:
 # ─────────────────────────────────────────────────────────────
 # モーダル
 # ─────────────────────────────────────────────────────────────
+def parse_ctx_input(s: str) -> int:
+    """context長の入力を解釈。'256k'->262144, '32k'->32768, '1m'->1048576, '200000'->200000。"""
+    s = s.strip().lower()
+    if s.endswith("k"):
+        return int(float(s[:-1]) * 1024)
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 1024 * 1024)
+    return int(s)
+
+
 class InputModal(ModalScreen[str | None]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, prompt: str, initial: str = "") -> None:
+    def __init__(self, prompt: str, initial: str = "", placeholder: str = "") -> None:
         super().__init__()
         self._prompt = prompt
         self._initial = initial
+        self._placeholder = placeholder
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(self._prompt)
-            yield Input(value=self._initial, id="field")
+            yield Input(value=self._initial, placeholder=self._placeholder, id="field")
             with Horizontal(id="buttons"):
                 yield Button("OK", variant="primary", id="ok")
                 yield Button("Cancel", id="cancel")
@@ -384,18 +396,34 @@ class OllamaManager(App):
         if not name:
             self.notify("モデルが選択されていません", severity="warning")
             return
-        base = name.split("-ctx")[0]  # 既に派生ならその元を base にする
+        base = re.sub(r"-(?:ctx\d+|\d+(?:\.\d+)?[kKmM])$", "", name)  # 既存の ctx サフィックスを除去
         value = await self.push_screen_wait(
-            InputModal(f"{base} の num_ctx を指定 → 派生 {base}-ctx<N> を作成", initial="32768")
+            InputModal(
+                f"{name} の context長 (num_ctx)   例: 8192, 32k, 128k, 256k  (k=×1024, m=×1024^2)",
+                initial="32k",
+                placeholder="例: 256k / 131072",
+            )
         )
         if not value:
             return
         try:
-            num = int(value)
+            num = parse_ctx_input(value)
+            if num <= 0:
+                raise ValueError
         except ValueError:
-            self.notify("数値を入力してください", severity="error")
+            self.notify(f"context長を解釈できません: {value}（例: 8192, 32k, 256k）", severity="error")
             return
-        await self._stream_create(f"{base}-ctx{num}", base, num)
+        label = value.strip().lower()
+        new_name = await self.push_screen_wait(
+            InputModal(
+                f"保存するモデル名 (num_ctx={num} で作成)",
+                initial=f"{base}-{label}",
+                placeholder=f"{base}-{label}",
+            )
+        )
+        if not new_name:
+            return
+        await self._stream_create(new_name, name, num)
         self.refresh_models()
 
     @work
