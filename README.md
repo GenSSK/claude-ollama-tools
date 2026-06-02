@@ -40,7 +40,7 @@ Ollama を常時起動にしておくと快適です（公式アプリの設定 
 Claude Code をローカル Ollama モデルで起動します。
 
 ```sh
-localclaude [-m|--model <name>] [-l|--list] [--keep] \
+localclaude [-m|--model <name>] [-l|--list] [--keep] [--host <url>] \
             [--bridge auto|native|litellm] [--ctx <n>] [-- <claude args...>]
 ```
 
@@ -51,6 +51,7 @@ localclaude [-m|--model <name>] [-l|--list] [--keep] \
 | `--keep` | 終了時にモデルを offload しない |
 | `--bridge <mode>` | `auto`（既定） / `native` / `litellm` |
 | `--ctx <n>` | 指定時のみ `<base>-ctx<n>` 派生モデルを作成（既定: 作らず指定モデルをそのまま使用） |
+| `--host <url>` | 接続先 Ollama（既定 `localhost:11434`）。`host` / `host:port` / `http://...` 可。環境変数 `LOCALCLAUDE_HOST` でも指定可。リモート指定時は自動起動せず、未接続ならエラー |
 | `-- <args...>` | 以降を素の `claude` にそのまま渡す |
 
 `--model` を省略すると、インストール済みモデルから選択します。
@@ -60,6 +61,7 @@ localclaude                          # モデルを選択して起動
 localclaude -m qwen3:30b             # モデル指定
 localclaude -- -c                    # claude を --continue で起動
 localclaude -m qwen3:30b -- -p "fix" # 非対話実行
+localclaude --host 192.168.2.31      # 別マシン(LAN)の Ollama を使う
 ```
 
 ### 動作
@@ -71,7 +73,7 @@ localclaude -m qwen3:30b -- -p "fix" # 非対話実行
 5. 環境変数（`ANTHROPIC_BASE_URL` 等）をサブプロセス内だけに注入して `claude` を起動 — 普段の本家 `claude` は無汚染
 6. 終了時に `ollama stop` でモデルを offload（`--keep` で抑止）
 
-環境変数 `LOCALCLAUDE_MODEL` / `LOCALCLAUDE_CTX` / `LOCALCLAUDE_TIMEOUT_MS` で既定値を上書きできます。
+環境変数 `LOCALCLAUDE_MODEL` / `LOCALCLAUDE_CTX` / `LOCALCLAUDE_HOST` / `LOCALCLAUDE_TIMEOUT_MS` で既定値を上書きできます。
 
 ---
 

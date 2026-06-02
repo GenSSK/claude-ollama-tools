@@ -28,7 +28,7 @@ SELF="${(%):-%x}"   # このスクリプト自身のパス（関数内 $0 は関
 # ─────────────────────────────────────────────────────────────
 DEFAULT_MODEL="${LOCALCLAUDE_MODEL:-qwen2.5-coder:32b}"  # 既定モデル（--model で上書き）
 NUM_CTX="${LOCALCLAUDE_CTX:-}"        # 既定は空＝焼き込まず指定モデルをそのまま使う。--ctx <n> 指定時のみ派生作成
-OLLAMA_HOST_URL="http://localhost:11434"
+DEFAULT_HOST="${LOCALCLAUDE_HOST:-${OLLAMA_HOST:-localhost:11434}}"  # 接続先 Ollama。--host で上書き（host / host:port / URL 可）
 LITELLM_PORT="${LOCALCLAUDE_LITELLM_PORT:-4000}"
 LITELLM_URL="http://localhost:${LITELLM_PORT}"
 KEEP_ALIVE="30m"                       # warm ロード時の保持時間（cleanup で明示 offload する）
@@ -54,7 +54,7 @@ localclaude — Claude Code をローカルの Ollama モデルで動かすラ�
   - claude の引数はそのまま透過（-- 区切り、または未知トークン以降を委譲）
 
 使い方:
-  localclaude [-m|--model <name>] [-l|--list] [--keep]
+  localclaude [-m|--model <name>] [-l|--list] [--keep] [--host <url>]
               [--bridge auto|native|litellm] [--ctx <n>] [-- <claude args...>]
 
 オプション:
@@ -63,6 +63,7 @@ localclaude — Claude Code をローカルの Ollama モデルで動かすラ�
       --keep           終了時にモデルを offload しない
       --bridge <mode>  auto(既定) | native | litellm
       --ctx <n>        指定時のみ <model>-ctx<n> 派生を作成（既定: 作らずモデルをそのまま使用）
+      --host <url>     接続先 Ollama（既定 localhost:11434 / 環境変数 LOCALCLAUDE_HOST でも可）
   -h, --help           このヘルプ
   -- <args...>         以降を素の claude にそのまま渡す
 
@@ -71,6 +72,7 @@ localclaude — Claude Code をローカルの Ollama モデルで動かすラ�
   localclaude -m qwen3:30b             # モデル指定
   localclaude -- -c                    # claude を --continue で起動
   localclaude -m qwen3:30b -- -p "fix" # 非対話実行
+  localclaude --host 192.168.2.31      # 別マシンの Ollama を使う
   localclaude --list                   # 利用可能モデル一覧
 USAGE
 }
@@ -82,6 +84,7 @@ USAGE
 MODEL="$DEFAULT_MODEL"
 MODEL_EXPLICIT=0          # --model が明示指定されたか（未指定なら対話選択）
 BRIDGE_MODE="auto"        # auto | native | litellm
+HOST_ARG=""               # --host（未指定なら DEFAULT_HOST）
 DO_LIST=0
 KEEP=0
 typeset -a claude_args
@@ -97,6 +100,8 @@ while (( $# )); do
     --bridge=*)   BRIDGE_MODE="${1#*=}" ;;
     --ctx)        shift; [[ $# -gt 0 ]] || die "--ctx に数値が必要です"; NUM_CTX="$1" ;;
     --ctx=*)      NUM_CTX="${1#*=}" ;;
+    --host)       shift; [[ $# -gt 0 ]] || die "--host に値が必要です"; HOST_ARG="$1" ;;
+    --host=*)     HOST_ARG="${1#*=}" ;;
     -h|--help)    usage; exit 0 ;;
     --)           shift; claude_args+=("$@"); break ;;   # 以降は全て claude へ
     *)            claude_args+=("$@"); break ;;          # 未知トークン以降も claude へ
@@ -110,6 +115,22 @@ case "$BRIDGE_MODE" in
 esac
 
 # ─────────────────────────────────────────────────────────────
+# 接続先 Ollama を解決（--host > LOCALCLAUDE_HOST/OLLAMA_HOST > localhost:11434）
+#   OLLAMA_HOST_URL: curl 用フルURL / OLLAMA_HOST: ollama CLI(list/pull/create/stop) 用 host:port
+# ─────────────────────────────────────────────────────────────
+_raw_host="${HOST_ARG:-$DEFAULT_HOST}"; _raw_host="${_raw_host%/}"
+if [[ "$_raw_host" == http://* ]];  then _scheme="http";  _hp="${_raw_host#http://}"
+elif [[ "$_raw_host" == https://* ]]; then _scheme="https"; _hp="${_raw_host#https://}"
+else _scheme="http"; _hp="$_raw_host"; fi
+[[ "$_hp" == *:* ]] || _hp="${_hp}:11434"      # ポート補完
+OLLAMA_HOST_URL="${_scheme}://${_hp}"
+export OLLAMA_HOST="$_hp"                       # ollama CLI もこのホストへ向ける
+case "$_hp" in
+  localhost:*|127.0.0.1:*|0.0.0.0:*|'[::1]:'*) IS_LOCAL=1 ;;
+  *) IS_LOCAL=0 ;;
+esac
+
+# ─────────────────────────────────────────────────────────────
 # 前提チェック
 # ─────────────────────────────────────────────────────────────
 command -v ollama >/dev/null 2>&1 || die "ollama 未インストール。'brew install ollama' を実行してください"
@@ -119,6 +140,9 @@ ollama_up() { curl -fsS --max-time 3 "${OLLAMA_HOST_URL}/api/tags" >/dev/null 2>
 
 ensure_ollama_serve() {
   if ollama_up; then return 0; fi
+  if (( ! IS_LOCAL )); then
+    die "リモート Ollama (${OLLAMA_HOST_URL}) に接続できません。サーバ側で ollama を起動してください"
+  fi
   log "ollama serve が応答しません。起動します…"
   if [[ -d /Applications/Ollama.app ]]; then
     open -a Ollama >/dev/null 2>&1 || warn "Ollama.app の起動に失敗"
