@@ -107,6 +107,23 @@ ollama-manager --host <URL>    # 接続先（既定 $OLLAMA_HOST または http:
 - Claude Code は **Anthropic Messages API**（`/v1/messages`）を話します。一方 Ollama は OpenAI 互換のほか、**ネイティブで Anthropic 互換エンドポイントも提供**しています。`localclaude` はこれを実測判定して直結します。
 - Claude Code はシステムプロンプト＋ツール定義が巨大なため、十分な context 長（32k 以上）のモデルを使ってください。`localclaude` は既定では**指定したモデルをそのまま使います**。モデル側の context が足りない場合のみ `--ctx <n>` を付けると、`PARAMETER num_ctx <n>` を焼き込んだ `<base>-ctx<n>` 派生モデルを自動作成します。
 
+## パフォーマンス / 高速化
+
+ローカルモデルでの Claude Code は、本家（クラウド）より明確に遅くなります。Claude Code は毎ターン巨大なプロンプト（ツール定義＋`CLAUDE.md`＋スキル群）を送り、その大半は **prefill（プロンプト処理）** に費やされます。クラウドはプロンプトキャッシュでこれを省けますが、ローカル（Ollama の `/v1/messages`）では基本的に毎回処理されます。目安として 31B 級モデルで prefill 約 300 tok/s・生成 約 13 tok/s（Apple M5 Pro）程度で、2〜4 万トークンのプロンプトだと最初の応答に 1〜2 分かかることがあります。
+
+効く順の対策:
+
+1. **小さめモデルを使う** — 体感に一番効きます。`qwen2.5-coder:14b` などはツール対応も強く、prefill・生成とも 2〜4 倍速。
+2. **flash attention ＋ KV キャッシュ量子化を有効化** — メモリと速度（特に長プロンプト）に効きます。Ollama 起動前に環境変数を設定して再起動します:
+   ```sh
+   launchctl setenv OLLAMA_FLASH_ATTENTION 1
+   launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
+   # Ollama アプリを再起動（quit → 再度起動）
+   ```
+   （`launchctl setenv` は OS 再起動で消えます。恒久化は LaunchAgent などで）
+3. **context 長を盛りすぎない** — 20 万トークン等は不要です。32k〜64k で十分で、KV キャッシュのメモリを大幅に節約できます（`localclaude --ctx <n>` や `ollama-manager` の `c`）。
+4. **プロンプトを軽くする** — 多数のスキルや大きい `CLAUDE.md` を読み込むディレクトリは prefill が増えます。軽いディレクトリで使うと速くなります。
+
 ## ライセンス
 
 [MIT](LICENSE)
