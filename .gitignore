@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python (ollama-manager は uv 管理だが念のため)
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editor
+*.swp
+.idea/
+.vscode/

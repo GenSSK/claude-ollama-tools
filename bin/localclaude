@@ -1,0 +1,328 @@
+#!/usr/bin/env zsh
+#
+# localclaude — Claude Code をローカルの Ollama モデルで動かすラッパー
+#
+#   - ollama serve は launchd 常駐前提（落ちていれば自動で brew services start）
+#   - Anthropic 互換 API を「ネイティブ → LiteLLM フォールバック」で自動判定
+#   - 終了時にモデルだけ offload（serve / bridge は残す）
+#   - claude の引数はそのまま透過（-- 区切り、または未知トークン以降を委譲）
+#
+# 使い方:
+#   localclaude [-m|--model <name>] [-l|--list] [--keep]
+#               [--bridge auto|native|litellm] [--ctx <n>] [-- <claude args...>]
+#
+# 例:
+#   localclaude                          # 既定モデルで対話起動
+#   localclaude -m qwen3:30b             # モデル指定
+#   localclaude -- -c                    # claude を --continue で起動
+#   localclaude -m qwen3:30b -- -p "fix" # 非対話実行
+#   localclaude --list                   # 利用可能モデル一覧
+#
+set -u
+setopt pipefail
+
+SELF="${(%):-%x}"   # このスクリプト自身のパス（関数内 $0 は関数名になるため）
+
+# ─────────────────────────────────────────────────────────────
+# 設定（ここを編集すれば既定値を変えられる）
+# ─────────────────────────────────────────────────────────────
+DEFAULT_MODEL="${LOCALCLAUDE_MODEL:-qwen2.5-coder:32b}"  # 既定モデル（--model で上書き）
+NUM_CTX="${LOCALCLAUDE_CTX:-}"        # 既定は空＝焼き込まず指定モデルをそのまま使う。--ctx <n> 指定時のみ派生作成
+OLLAMA_HOST_URL="http://localhost:11434"
+LITELLM_PORT="${LOCALCLAUDE_LITELLM_PORT:-4000}"
+LITELLM_URL="http://localhost:${LITELLM_PORT}"
+KEEP_ALIVE="30m"                       # warm ロード時の保持時間（cleanup で明示 offload する）
+API_TIMEOUT_MS="${LOCALCLAUDE_TIMEOUT_MS:-600000}"  # ローカルは遅いので長め
+STATE_DIR="${HOME}/.cache/localclaude"
+
+# ─────────────────────────────────────────────────────────────
+# 出力ヘルパ
+# ─────────────────────────────────────────────────────────────
+_c_blue=$'\e[34m'; _c_yellow=$'\e[33m'; _c_red=$'\e[31m'; _c_dim=$'\e[2m'; _c_off=$'\e[0m'
+log()  { print -r -- "${_c_blue}[localclaude]${_c_off} $*" >&2; }
+warn() { print -r -- "${_c_yellow}[localclaude] warn:${_c_off} $*" >&2; }
+err()  { print -r -- "${_c_red}[localclaude] error:${_c_off} $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+usage() {
+  cat >&2 <<'USAGE'
+localclaude — Claude Code をローカルの Ollama モデルで動かすラッパー
+
+  - ollama serve は launchd 常駐前提（落ちていれば自動で brew services start）
+  - Anthropic 互換 API を「ネイティブ → LiteLLM フォールバック」で自動判定
+  - 終了時にモデルだけ offload（serve / bridge は残す）
+  - claude の引数はそのまま透過（-- 区切り、または未知トークン以降を委譲）
+
+使い方:
+  localclaude [-m|--model <name>] [-l|--list] [--keep]
+              [--bridge auto|native|litellm] [--ctx <n>] [-- <claude args...>]
+
+オプション:
+  -m, --model <name>   使う Ollama モデル（既定: $LOCALCLAUDE_MODEL or qwen2.5-coder:32b）
+  -l, --list           ollama list を表示して終了
+      --keep           終了時にモデルを offload しない
+      --bridge <mode>  auto(既定) | native | litellm
+      --ctx <n>        指定時のみ <model>-ctx<n> 派生を作成（既定: 作らずモデルをそのまま使用）
+  -h, --help           このヘルプ
+  -- <args...>         以降を素の claude にそのまま渡す
+
+例:
+  localclaude                          # 既定モデルで対話起動
+  localclaude -m qwen3:30b             # モデル指定
+  localclaude -- -c                    # claude を --continue で起動
+  localclaude -m qwen3:30b -- -p "fix" # 非対話実行
+  localclaude --list                   # 利用可能モデル一覧
+USAGE
+}
+
+# ─────────────────────────────────────────────────────────────
+# 引数パース
+#   localclaude 自身のフラグを食い、未知トークン or `--` 以降を claude へ委譲
+# ─────────────────────────────────────────────────────────────
+MODEL="$DEFAULT_MODEL"
+MODEL_EXPLICIT=0          # --model が明示指定されたか（未指定なら対話選択）
+BRIDGE_MODE="auto"        # auto | native | litellm
+DO_LIST=0
+KEEP=0
+typeset -a claude_args
+claude_args=()
+
+while (( $# )); do
+  case "$1" in
+    -m|--model)   shift; [[ $# -gt 0 ]] || die "--model にモデル名が必要です"; MODEL="$1"; MODEL_EXPLICIT=1 ;;
+    --model=*)    MODEL="${1#*=}"; MODEL_EXPLICIT=1 ;;
+    -l|--list)    DO_LIST=1 ;;
+    --keep)       KEEP=1 ;;
+    --bridge)     shift; [[ $# -gt 0 ]] || die "--bridge に値が必要です"; BRIDGE_MODE="$1" ;;
+    --bridge=*)   BRIDGE_MODE="${1#*=}" ;;
+    --ctx)        shift; [[ $# -gt 0 ]] || die "--ctx に数値が必要です"; NUM_CTX="$1" ;;
+    --ctx=*)      NUM_CTX="${1#*=}" ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; claude_args+=("$@"); break ;;   # 以降は全て claude へ
+    *)            claude_args+=("$@"); break ;;          # 未知トークン以降も claude へ
+  esac
+  shift
+done
+
+case "$BRIDGE_MODE" in
+  auto|native|litellm) ;;
+  *) die "--bridge は auto|native|litellm のいずれか（指定: $BRIDGE_MODE）" ;;
+esac
+
+# ─────────────────────────────────────────────────────────────
+# 前提チェック
+# ─────────────────────────────────────────────────────────────
+command -v ollama >/dev/null 2>&1 || die "ollama 未インストール。'brew install ollama' を実行してください"
+command -v curl   >/dev/null 2>&1 || die "curl が見つかりません"
+
+ollama_up() { curl -fsS --max-time 3 "${OLLAMA_HOST_URL}/api/tags" >/dev/null 2>&1; }
+
+ensure_ollama_serve() {
+  if ollama_up; then return 0; fi
+  log "ollama serve が応答しません。起動します…"
+  if [[ -d /Applications/Ollama.app ]]; then
+    open -a Ollama >/dev/null 2>&1 || warn "Ollama.app の起動に失敗"
+  elif command -v brew >/dev/null 2>&1; then
+    brew services start ollama >/dev/null 2>&1 || warn "brew services start ollama に失敗"
+  else
+    warn "Homebrew/アプリが無いため 'ollama serve' をバックグラウンド起動します"
+    nohup ollama serve >/dev/null 2>&1 &
+    disown 2>/dev/null
+  fi
+  # 起動待ち（最大 ~15s）
+  local i
+  for i in {1..30}; do ollama_up && { log "ollama serve 起動完了"; return 0; }; sleep 0.5; done
+  die "ollama serve を起動できませんでした"
+}
+
+# --model 未指定時にインストール済みモデルから番号メニューで選択させる
+select_model() {
+  ensure_ollama_serve
+  local -a models
+  models=("${(@f)$(ollama list 2>/dev/null | awk 'NR>1 && $1!="" {print $1}')}")
+  if (( ${#models} == 0 )); then
+    warn "インストール済みモデルがありません → 既定 ${DEFAULT_MODEL} を使用（無ければ pull します）"
+    MODEL="$DEFAULT_MODEL"
+    return
+  fi
+  print -r -- "使用するモデルを選択してください:" >&2
+  local i=1 m
+  for m in "${models[@]}"; do
+    print -r -- "  ${i}) ${m}" >&2
+    (( i++ ))
+  done
+  local sel
+  print -rn -- "番号を入力 [1-${#models}] (Enter=1): " >&2
+  read -r sel
+  [[ -z "$sel" ]] && sel=1
+  if [[ "$sel" == <-> ]] && (( sel >= 1 && sel <= ${#models} )); then
+    MODEL="${models[$sel]}"
+    log "選択: ${MODEL}"
+  else
+    die "無効な選択: ${sel}"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# --list は serve だけ確認して一覧表示
+# ─────────────────────────────────────────────────────────────
+if (( DO_LIST )); then
+  ensure_ollama_serve
+  ollama list
+  exit 0
+fi
+
+# --model 省略時はモデルを選択させる（対話端末のときのみ／非対話は既定モデル）
+if (( ! MODEL_EXPLICIT )); then
+  if [[ -t 0 && -t 1 ]]; then
+    select_model
+  else
+    warn "--model 未指定かつ非対話 → 既定 ${DEFAULT_MODEL} を使用"
+    MODEL="$DEFAULT_MODEL"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────
+# モデル準備（必要なら pull、NUM_CTX 指定時は ctx 焼き込み版を create）
+#   RUN_MODEL = 実際に claude へ渡すモデル名
+# ─────────────────────────────────────────────────────────────
+model_exists() { ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$1"; }
+
+prepare_model() {
+  ensure_ollama_serve
+  local base="$MODEL"
+
+  if [[ -z "$NUM_CTX" || "$NUM_CTX" == "0" ]]; then
+    RUN_MODEL="$base"
+    model_exists "$RUN_MODEL" || { log "モデル取得: ollama pull $RUN_MODEL"; ollama pull "$RUN_MODEL" || die "pull 失敗: $RUN_MODEL"; }
+    return 0
+  fi
+
+  # ctx 焼き込み版（例: qwen2.5-coder:32b → qwen2.5-coder:32b-ctx32768）
+  RUN_MODEL="${base}-ctx${NUM_CTX}"
+  if model_exists "$RUN_MODEL"; then return 0; fi
+
+  model_exists "$base" || { log "ベースモデル取得: ollama pull $base"; ollama pull "$base" || die "pull 失敗: $base"; }
+  log "context長 ${NUM_CTX} を焼き込んだ派生モデルを作成: ${RUN_MODEL}"
+  mkdir -p "$STATE_DIR"
+  local mf="${STATE_DIR}/Modelfile.${RUN_MODEL//[:\/]/_}"
+  # 注意: zsh の print -r は \n を展開しない。Modelfile を正しく複数行にするため printf を使う
+  printf 'FROM %s\nPARAMETER num_ctx %s\n' "$base" "$NUM_CTX" > "$mf"
+  ollama create "$RUN_MODEL" -f "$mf" || die "ollama create 失敗: $RUN_MODEL"
+}
+
+# ─────────────────────────────────────────────────────────────
+# ブリッジ判定: ネイティブ Anthropic 互換が喋れるか実測
+# ─────────────────────────────────────────────────────────────
+native_anthropic_ok() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+    -X POST "${OLLAMA_HOST_URL}/v1/messages" \
+    -H 'content-type: application/json' \
+    -H 'anthropic-version: 2023-06-01' \
+    -d "{\"model\":\"${RUN_MODEL}\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" 2>/dev/null)
+  [[ "$code" == "200" ]]
+}
+
+litellm_up() { curl -fsS --max-time 3 "${LITELLM_URL}/v1/models" >/dev/null 2>&1; }
+
+start_litellm() {
+  command -v litellm >/dev/null 2>&1 || die "litellm 未インストール（fallback に必要）。'uv tool install litellm[proxy]' 等で導入を"
+  if litellm_up; then
+    # 既存 proxy が現モデルを serve していれば再利用。別モデル設定なら停止して作り直す
+    if curl -fsS --max-time 3 "${LITELLM_URL}/v1/models" 2>/dev/null | grep -qF "\"${RUN_MODEL}\""; then
+      log "LiteLLM は既に :${LITELLM_PORT} で稼働中（${RUN_MODEL}）"; return 0
+    fi
+    warn "既存 LiteLLM が別モデル設定 → 停止して ${RUN_MODEL} 用に再起動します"
+    local -a pids; pids=(${(f)"$(lsof -ti tcp:${LITELLM_PORT} 2>/dev/null)"})
+    (( ${#pids} )) && kill ${pids} 2>/dev/null
+    sleep 1
+  fi
+  mkdir -p "$STATE_DIR"
+  local cfg="${STATE_DIR}/litellm.config.yaml"
+  cat > "$cfg" <<YAML
+model_list:
+  - model_name: ${RUN_MODEL}
+    litellm_params:
+      model: ollama_chat/${RUN_MODEL}
+      api_base: ${OLLAMA_HOST_URL}
+litellm_settings:
+  drop_params: true   # Claude Code 2.1.x が送る context_management 等の未対応paramを捨てる
+YAML
+  log "LiteLLM ブリッジを起動 (:${LITELLM_PORT})…"
+  nohup litellm --config "$cfg" --port "$LITELLM_PORT" \
+    > "${STATE_DIR}/litellm.log" 2>&1 &
+  disown 2>/dev/null
+  local i
+  for i in {1..40}; do litellm_up && { log "LiteLLM 起動完了"; return 0; }; sleep 0.5; done
+  die "LiteLLM を起動できませんでした（${STATE_DIR}/litellm.log を確認）"
+}
+
+resolve_bridge() {
+  case "$BRIDGE_MODE" in
+    native)  ANTHROPIC_BASE_URL_VAL="$OLLAMA_HOST_URL"; log "bridge=native (強制)" ;;
+    litellm) start_litellm; ANTHROPIC_BASE_URL_VAL="$LITELLM_URL"; log "bridge=litellm (強制)" ;;
+    auto)
+      if native_anthropic_ok; then
+        ANTHROPIC_BASE_URL_VAL="$OLLAMA_HOST_URL"; log "bridge=native（Ollama が Anthropic 互換を提供）"
+      else
+        warn "Ollama ネイティブの Anthropic 互換が確認できず → LiteLLM にフォールバック"
+        start_litellm; ANTHROPIC_BASE_URL_VAL="$LITELLM_URL"; log "bridge=litellm"
+      fi ;;
+  esac
+}
+
+# ─────────────────────────────────────────────────────────────
+# warm ロード（keep_alive 付きでメモリへ）
+# ─────────────────────────────────────────────────────────────
+warm_model() {
+  log "モデルを warm ロード: ${RUN_MODEL}"
+  curl -fsS --max-time 120 "${OLLAMA_HOST_URL}/api/generate" \
+    -d "{\"model\":\"${RUN_MODEL}\",\"keep_alive\":\"${KEEP_ALIVE}\"}" >/dev/null 2>&1 \
+    || warn "warm ロードに失敗（claude 起動後にロードされます）"
+}
+
+# ─────────────────────────────────────────────────────────────
+# cleanup: モデルのみ offload（serve / bridge は残す）
+# ─────────────────────────────────────────────────────────────
+cleanup() {
+  trap - EXIT INT TERM
+  if (( KEEP )); then
+    log "--keep 指定: モデルは offload しません（${RUN_MODEL}）"
+    return
+  fi
+  log "モデルを offload: ${RUN_MODEL}"
+  if ! ollama stop "$RUN_MODEL" >/dev/null 2>&1; then
+    # 古い ollama 向けフォールバック（keep_alive:0 で即アンロード）
+    curl -fsS --max-time 10 "${OLLAMA_HOST_URL}/api/generate" \
+      -d "{\"model\":\"${RUN_MODEL}\",\"keep_alive\":0}" >/dev/null 2>&1 || true
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# 実行
+# ─────────────────────────────────────────────────────────────
+command -v claude >/dev/null 2>&1 || die "claude（Claude Code）が見つかりません"
+
+prepare_model
+resolve_bridge
+warm_model
+
+log "Claude Code を起動 — model=${RUN_MODEL} / base=${ANTHROPIC_BASE_URL_VAL}"
+log "${_c_dim}（終了すると ${RUN_MODEL} を offload します）${_c_off}"
+
+trap cleanup EXIT INT TERM
+
+# env はこの子プロセスにだけ注入（普段の本家 claude を汚さない）
+ANTHROPIC_BASE_URL="$ANTHROPIC_BASE_URL_VAL" \
+ANTHROPIC_AUTH_TOKEN="ollama" \
+ANTHROPIC_API_KEY="" \
+ANTHROPIC_MODEL="$RUN_MODEL" \
+ANTHROPIC_SMALL_FAST_MODEL="$RUN_MODEL" \
+ANTHROPIC_DEFAULT_HAIKU_MODEL="$RUN_MODEL" \
+ANTHROPIC_DEFAULT_SONNET_MODEL="$RUN_MODEL" \
+ANTHROPIC_DEFAULT_OPUS_MODEL="$RUN_MODEL" \
+API_TIMEOUT_MS="$API_TIMEOUT_MS" \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1" \
+  claude "${claude_args[@]}"
+# cleanup は trap(EXIT) で実行される

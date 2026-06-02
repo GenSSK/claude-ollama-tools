@@ -1,0 +1,563 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["textual>=0.80", "httpx>=0.27"]
+# ///
+"""
+ollama-manager — Ollama モデル管理 TUI
+
+  Ollama の REST API を叩く薄いフロントエンド。
+    - 一覧（サイズ / 現在の context長 / ロード状態）
+    - pull（ダウンロード進捗バー）
+    - 削除
+    - num_ctx を変えた派生モデルの作成（<base>-ctx<N>）  ← localclaude と命名規約を共有
+    - ロード中モデルの unload
+    - 詳細表示（ollama show 相当）
+
+  キー操作:
+    r=更新  p=pull  d=削除  c=ctx変更(派生作成)  u=unload  enter/s=詳細  q=終了
+
+  非対話モード（TTY不要・スクリプト/テスト用）:
+    ollama-manager --check     接続確認のみ（exit 0/1）
+    ollama-manager --list      モデル一覧をテキスト出力
+    ollama-manager --host URL  接続先（既定 $OLLAMA_HOST or http://localhost:11434）
+
+  依存は uv が初回に自動取得します（グローバル環境を汚しません）。
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+
+import httpx
+
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ProgressBar,
+    RichLog,
+    Static,
+)
+
+
+# ─────────────────────────────────────────────────────────────
+# 接続先の正規化（OLLAMA_HOST は "host:port"（scheme無し）の場合がある）
+# ─────────────────────────────────────────────────────────────
+def normalize_host(raw: str) -> str:
+    u = raw.strip()
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "http://" + u
+    return u.rstrip("/")
+
+
+DEFAULT_HOST = normalize_host(
+    os.environ.get("OLLAMA_HOST_URL") or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+)
+
+
+# ─────────────────────────────────────────────────────────────
+# 小物
+# ─────────────────────────────────────────────────────────────
+def human_size(n: float) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
+def parse_ctx(show: dict) -> tuple[int | None, int | None]:
+    """(num_ctx 上書き値, 学習時の context_length) を返す。"""
+    override = None
+    for line in (show.get("parameters") or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "num_ctx":
+            try:
+                override = int(parts[1])
+            except ValueError:
+                pass
+    trained = None
+    for key, val in (show.get("model_info") or {}).items():
+        if key.endswith(".context_length"):
+            try:
+                trained = int(val)
+            except (ValueError, TypeError):
+                pass
+    return override, trained
+
+
+def build_show_body(name: str, show: dict) -> str:
+    details = show.get("details") or {}
+    override, trained = parse_ctx(show)
+    lines = [
+        f"family        : {details.get('family', '-')}",
+        f"parameter size: {details.get('parameter_size', '-')}",
+        f"quantization  : {details.get('quantization_level', '-')}",
+        f"trained ctx   : {trained if trained else '-'}",
+        f"num_ctx 上書き : {override if override else '(なし)'}",
+    ]
+    params = show.get("parameters") or ""
+    if params:
+        lines.append("\n[parameters]\n" + params)
+    template = show.get("template") or ""
+    if template:
+        snippet = template[:600] + ("…" if len(template) > 600 else "")
+        lines.append("\n[template (先頭)]\n" + snippet)
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
+# モーダル
+# ─────────────────────────────────────────────────────────────
+class InputModal(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt: str, initial: str = "") -> None:
+        super().__init__()
+        self._prompt = prompt
+        self._initial = initial
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._prompt)
+            yield Input(value=self._initial, id="field")
+            with Horizontal(id="buttons"):
+                yield Button("OK", variant="primary", id="ok")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#field", Input).focus()
+
+    @on(Input.Submitted)
+    def _on_submit(self) -> None:
+        self.dismiss(self.query_one("#field", Input).value.strip())
+
+    @on(Button.Pressed, "#ok")
+    def _on_ok(self) -> None:
+        self.dismiss(self.query_one("#field", Input).value.strip())
+
+    @on(Button.Pressed, "#cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmModal(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("escape", "no", "No"),
+        Binding("y", "yes", "Yes"),
+        Binding("n", "no", "No"),
+    ]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._message)
+            with Horizontal(id="buttons"):
+                yield Button("Yes (y)", variant="error", id="yes")
+                yield Button("No (n)", id="no")
+
+    @on(Button.Pressed, "#yes")
+    def _yes(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#no")
+    def _no(self) -> None:
+        self.dismiss(False)
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
+class InfoModal(ModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("q", "close", "Close")]
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog-wide"):
+            yield Label(self._title, id="info-title")
+            with VerticalScroll():
+                yield Static(self._body)
+            yield Button("Close (esc)", id="close")
+
+    @on(Button.Pressed, "#close")
+    def _close(self) -> None:
+        self.dismiss()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+# ─────────────────────────────────────────────────────────────
+# メイン App
+# ─────────────────────────────────────────────────────────────
+class OllamaManager(App):
+    CSS = """
+    Screen { layers: base; }
+    #models { height: 1fr; }
+    #progressrow { height: 1; padding: 0 1; }
+    #status { width: 1fr; color: $text-muted; }
+    #log { height: 10; border-top: solid $primary; padding: 0 1; }
+    ModalScreen { align: center middle; }
+    #dialog { background: $surface; border: thick $primary; padding: 1 2; width: 72; height: auto; }
+    #dialog-wide { background: $surface; border: thick $primary; padding: 1 2; width: 90%; height: 80%; }
+    #info-title { text-style: bold; color: $accent; }
+    #buttons { height: auto; align-horizontal: right; }
+    Button { margin: 1 1 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("r", "refresh", "更新"),
+        Binding("p", "pull", "pull"),
+        Binding("d", "delete", "削除"),
+        Binding("c", "ctx", "ctx変更"),
+        Binding("u", "unload", "unload"),
+        Binding("s", "show", "詳細"),
+        Binding("enter", "show", "詳細", show=False),
+        Binding("q", "quit", "終了"),
+    ]
+
+    def __init__(self, host: str) -> None:
+        super().__init__()
+        self.host = host
+        self.model_names: list[str] = []
+        self.client: httpx.AsyncClient | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(id="models")
+        with Horizontal(id="progressrow"):
+            yield Static("", id="status")
+            yield ProgressBar(id="progress", total=100)
+        yield RichLog(id="log", highlight=True, markup=True, wrap=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "ollama-manager"
+        self.sub_title = self.host
+        self.client = httpx.AsyncClient(base_url=self.host, timeout=httpx.Timeout(30.0, read=None))
+        table = self.query_one("#models", DataTable)
+        table.add_columns("MODEL", "SIZE", "CTX", "MODIFIED", "LOADED")
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        self._set_progress_visible(False)
+        self.refresh_models()
+
+    async def on_unmount(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+
+    # ---- ヘルパ ----
+    def log_write(self, msg: str) -> None:
+        self.query_one("#log", RichLog).write(msg)
+
+    def _status(self, text: str) -> None:
+        self.query_one("#status", Static).update(text)
+
+    def _set_progress_visible(self, visible: bool) -> None:
+        self.query_one("#progressrow").display = visible
+        if not visible:
+            self._status("")
+
+    def selected_model(self) -> str | None:
+        table = self.query_one("#models", DataTable)
+        row = table.cursor_row
+        if 0 <= row < len(self.model_names):
+            return self.model_names[row]
+        return None
+
+    async def _show(self, name: str) -> dict:
+        assert self.client is not None
+        resp = await self.client.post("/api/show", json={"model": name})
+        resp.raise_for_status()
+        return resp.json()
+
+    # ---- 一覧更新 ----
+    @work(exclusive=True, group="refresh")
+    async def refresh_models(self) -> None:
+        assert self.client is not None
+        table = self.query_one("#models", DataTable)
+        try:
+            tags = (await self.client.get("/api/tags")).json().get("models", [])
+            ps = (await self.client.get("/api/ps")).json().get("models", [])
+        except Exception as exc:  # noqa: BLE001
+            self.log_write(f"[red]接続失敗: {exc}[/]  ([dim]ollama serve は起動していますか？[/])")
+            return
+        loaded = {m.get("name") for m in ps}
+        shows = await asyncio.gather(
+            *[self._show(m["name"]) for m in tags], return_exceptions=True
+        )
+        table.clear()
+        self.model_names = []
+        for meta, show in zip(tags, shows):
+            name = meta["name"]
+            ctx = "-"
+            if isinstance(show, dict):
+                override, trained = parse_ctx(show)
+                ctx = f"{override}*" if override else (str(trained) if trained else "-")
+            table.add_row(
+                name,
+                human_size(meta.get("size", 0)),
+                ctx,
+                (meta.get("modified_at") or "")[:10],
+                "●" if name in loaded else "",
+            )
+            self.model_names.append(name)
+        self.log_write(f"{len(tags)} モデル / {len(loaded)} ロード中  ([dim]* = num_ctx 上書き[/])")
+
+    # ---- アクション ----
+    def action_refresh(self) -> None:
+        self.refresh_models()
+
+    def action_pull(self) -> None:
+        self._pull_flow()
+
+    def action_delete(self) -> None:
+        self._delete_flow()
+
+    def action_ctx(self) -> None:
+        self._ctx_flow()
+
+    def action_unload(self) -> None:
+        self._unload_flow()
+
+    def action_show(self) -> None:
+        self._show_flow()
+
+    @work
+    async def _pull_flow(self) -> None:
+        name = await self.push_screen_wait(
+            InputModal("pull するモデル名 (例: qwen2.5-coder:32b)")
+        )
+        if not name:
+            return
+        await self._stream_pull(name)
+        self.refresh_models()
+
+    @work
+    async def _delete_flow(self) -> None:
+        name = self.selected_model()
+        if not name:
+            self.notify("モデルが選択されていません", severity="warning")
+            return
+        if not await self.push_screen_wait(ConfirmModal(f"削除しますか?  {name}")):
+            return
+        assert self.client is not None
+        try:
+            resp = await self.client.request("DELETE", "/api/delete", json={"model": name})
+            if resp.status_code >= 400:  # 旧 API は {"name": ...}
+                resp = await self.client.request("DELETE", "/api/delete", json={"name": name})
+            resp.raise_for_status()
+            self.log_write(f"[green]削除: {name}[/]")
+        except Exception as exc:  # noqa: BLE001
+            self.log_write(f"[red]削除失敗: {exc}[/]")
+        self.refresh_models()
+
+    @work
+    async def _ctx_flow(self) -> None:
+        name = self.selected_model()
+        if not name:
+            self.notify("モデルが選択されていません", severity="warning")
+            return
+        base = name.split("-ctx")[0]  # 既に派生ならその元を base にする
+        value = await self.push_screen_wait(
+            InputModal(f"{base} の num_ctx を指定 → 派生 {base}-ctx<N> を作成", initial="32768")
+        )
+        if not value:
+            return
+        try:
+            num = int(value)
+        except ValueError:
+            self.notify("数値を入力してください", severity="error")
+            return
+        await self._stream_create(f"{base}-ctx{num}", base, num)
+        self.refresh_models()
+
+    @work
+    async def _unload_flow(self) -> None:
+        name = self.selected_model()
+        if not name:
+            self.notify("モデルが選択されていません", severity="warning")
+            return
+        assert self.client is not None
+        try:
+            await self.client.post("/api/generate", json={"model": name, "keep_alive": 0})
+            self.log_write(f"[green]unload: {name}[/]")
+        except Exception as exc:  # noqa: BLE001
+            self.log_write(f"[red]unload 失敗: {exc}[/]")
+        self.refresh_models()
+
+    @work
+    async def _show_flow(self) -> None:
+        name = self.selected_model()
+        if not name:
+            self.notify("モデルが選択されていません", severity="warning")
+            return
+        try:
+            show = await self._show(name)
+        except Exception as exc:  # noqa: BLE001
+            self.log_write(f"[red]詳細取得失敗: {exc}[/]")
+            return
+        await self.push_screen_wait(InfoModal(name, build_show_body(name, show)))
+
+    # ---- ストリーミング処理 ----
+    async def _stream_pull(self, name: str) -> None:
+        assert self.client is not None
+        self._set_progress_visible(True)
+        progress = self.query_one("#progress", ProgressBar)
+        self.log_write(f"pull: {name} …")
+        try:
+            async with self.client.stream(
+                "POST", "/api/pull", json={"model": name, "stream": True}, timeout=None
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    self.log_write(f"[red]pull 失敗 HTTP {resp.status_code}: {body[:200]!r}[/]")
+                    return
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    msg = json.loads(line)
+                    if "error" in msg:
+                        self.log_write(f"[red]{msg['error']}[/]")
+                        break
+                    if msg.get("total") and "completed" in msg:
+                        progress.update(total=msg["total"], progress=msg["completed"])
+                    self._status(msg.get("status", ""))
+            self.log_write(f"[green]pull 完了: {name}[/]")
+        except Exception as exc:  # noqa: BLE001
+            self.log_write(f"[red]pull エラー: {exc}[/]")
+        finally:
+            self._set_progress_visible(False)
+
+    async def _stream_create(self, new_name: str, base: str, num_ctx: int) -> None:
+        self.log_write(f"create: {new_name}  (FROM {base}, num_ctx={num_ctx}) …")
+        self._set_progress_visible(True)
+        # 新 API（from + parameters）を試し、ダメなら旧 API（modelfile 文字列）にフォールバック
+        payloads = [
+            {"model": new_name, "from": base, "parameters": {"num_ctx": num_ctx}, "stream": True},
+            {"name": new_name, "modelfile": f"FROM {base}\nPARAMETER num_ctx {num_ctx}", "stream": True},
+        ]
+        try:
+            for idx, payload in enumerate(payloads):
+                if await self._run_create(payload):
+                    self.log_write(f"[green]作成完了: {new_name}[/]")
+                    return
+                if idx == 0:
+                    self.log_write("[yellow]新 API 形式で失敗 → 旧 modelfile 形式で再試行[/]")
+            self.log_write(f"[red]作成失敗: {new_name}[/]")
+        finally:
+            self._set_progress_visible(False)
+
+    async def _run_create(self, payload: dict) -> bool:
+        assert self.client is not None
+        try:
+            async with self.client.stream(
+                "POST", "/api/create", json=payload, timeout=None
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    self.log_write(f"[dim]HTTP {resp.status_code}: {body[:120]!r}[/]")
+                    return False
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    msg = json.loads(line)
+                    if "error" in msg:
+                        self.log_write(f"[dim]{msg['error']}[/]")
+                        return False
+                    if msg.get("total") and "completed" in msg:
+                        self.query_one("#progress", ProgressBar).update(
+                            total=msg["total"], progress=msg["completed"]
+                        )
+                    self._status(msg.get("status", ""))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.log_write(f"[dim]{exc}[/]")
+            return False
+
+
+# ─────────────────────────────────────────────────────────────
+# 非対話モード（TTY 不要）
+# ─────────────────────────────────────────────────────────────
+def cli_check(host: str) -> int:
+    try:
+        resp = httpx.get(f"{host}/api/tags", timeout=5)
+        resp.raise_for_status()
+        n = len(resp.json().get("models", []))
+        print(f"OK: {host} に接続できます（{n} モデル）")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"NG: {host} に接続できません: {exc}", file=sys.stderr)
+        return 1
+
+
+def cli_list(host: str) -> int:
+    try:
+        models = httpx.get(f"{host}/api/tags", timeout=10).json().get("models", [])
+    except Exception as exc:  # noqa: BLE001
+        print(f"接続失敗: {exc}", file=sys.stderr)
+        return 1
+    if not models:
+        print("(モデルなし)")
+        return 0
+    print(f"{'MODEL':40} {'SIZE':>10}  CTX")
+    for meta in models:
+        name = meta["name"]
+        ctx = "-"
+        try:
+            show = httpx.post(f"{host}/api/show", json={"model": name}, timeout=10).json()
+            override, trained = parse_ctx(show)
+            ctx = f"{override}*" if override else (str(trained) if trained else "-")
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"{name:40} {human_size(meta.get('size', 0)):>10}  {ctx}")
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="ollama-manager", description="Ollama モデル管理 TUI"
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="接続先 (既定 %(default)s)")
+    parser.add_argument("--check", action="store_true", help="接続確認のみ")
+    parser.add_argument("--list", action="store_true", help="モデル一覧をテキスト出力")
+    args = parser.parse_args()
+
+    host = normalize_host(args.host)
+    if args.check:
+        sys.exit(cli_check(host))
+    if args.list:
+        sys.exit(cli_list(host))
+    OllamaManager(host).run()
+
+
+if __name__ == "__main__":
+    main()
