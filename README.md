@@ -1,6 +1,6 @@
 # claude-ollama-tools
 
-ローカルの [Ollama](https://ollama.com) で [Claude Code](https://claude.com/claude-code) を動かし、モデルを管理するための **macOS / Linux** 向けコマンド集です（Windows は WSL 経由で Linux として動作）。
+ローカルの [Ollama](https://ollama.com) で [Claude Code](https://claude.com/claude-code) を動かし、モデルを管理するための **macOS / Linux / Windows** 向けコマンド集です。
 
 - **`localclaude`** — Ollama のローカルモデルで Claude Code を起動するラッパー。起動時にモデルを warm ロードし、終了時に自動で offload します。
 - **`ollama-manager`** — Ollama モデルを管理する TUI（一覧 / ダウンロード / 削除 / context 長変更 / unload / 詳細）。
@@ -12,7 +12,7 @@
 
 | | 用途 |
 |---|---|
-| OS | macOS（Apple Silicon で動作確認）/ Linux（bash 3.2+）。Windows は未対応（WSL なら Linux として動作） |
+| OS | macOS（Apple Silicon で動作確認）/ Linux（bash 3.2+）/ Windows（PowerShell 5.1+ / 7） |
 | [Ollama](https://ollama.com) | macOS: 公式アプリ版推奨 `brew install --cask ollama`（formula 版はランナー `llama-server` を欠くことあり）。Linux: `curl -fsSL https://ollama.com/install.sh \| sh` |
 | [Claude Code](https://claude.com/claude-code) | `claude` コマンド |
 | [uv](https://docs.astral.sh/uv/) | `ollama-manager` の実行に必要（依存は初回に自動取得） |
@@ -21,6 +21,8 @@
 `localclaude` は Ollama のネイティブ Anthropic 互換エンドポイント（`/v1/messages`）を自動判定して直結します。無い場合は [LiteLLM](https://github.com/BerriAI/litellm) にフォールバックします（要 `litellm`）。
 
 ## インストール
+
+### macOS / Linux
 
 ```sh
 git clone https://github.com/GenSSK/claude-ollama-tools.git
@@ -38,7 +40,25 @@ cd claude-ollama-tools
 
 `install.sh` は PATH 未通知の警告、`ollama` / `claude` の有無チェックも行い、`uv`（`ollama-manager` に必要）が無ければインストールするか尋ねます。
 
-Ollama を常時起動にしておくと快適です（公式アプリの設定 → "Launch at login"）。
+### Windows（PowerShell）
+
+```powershell
+git clone https://github.com/GenSSK/claude-ollama-tools.git
+cd claude-ollama-tools
+powershell -ExecutionPolicy Bypass -File .\install.ps1     # 既定 %USERPROFILE%\.local\bin
+```
+
+```powershell
+.\install.ps1 -BinDir C:\tools\bin   # インストール先を変更
+.\install.ps1 -Copy                  # 参照でなくコピー
+.\uninstall.ps1                      # アンインストール（-BinDir / -Purge 可）
+```
+
+`install.ps1` は `localclaude.cmd` / `ollama-manager.cmd` を BinDir に作成し（cmd / PowerShell どちらからでも実行可）、ユーザー PATH に追加、`uv` が無ければ導入を尋ねます。localclaude は PowerShell 版（`bin\localclaude.ps1`）が動きます。
+
+> ⚠️ Windows 版は作者が実機検証していません。不具合があれば Issue へ。
+
+Ollama を常時起動にしておくと快適です（macOS: 公式アプリ "Launch at login" ／ Windows: スタートアップ登録）。
 
 ---
 
