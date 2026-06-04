@@ -10,6 +10,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"   # 既定のインストール先（環境変数 BIN_DIR でも可）
 MODE="symlink"                           # symlink（既定）| copy
 TOOLS="localclaude ollama-manager"
+OS="$(uname -s)"
 
 c_b=$'\033[34m'; c_y=$'\033[33m'; c_r=$'\033[31m'; c_g=$'\033[32m'; c_0=$'\033[0m'
 log()  { printf '%s[install]%s %s\n'        "$c_b" "$c_0" "$*"; }
@@ -82,9 +83,14 @@ case ":$PATH:" in
 esac
 
 # ── 前提ツールの確認（インストールはしない・警告のみ）─────────────
-command -v ollama >/dev/null 2>&1 || warn "ollama 未検出。公式アプリ推奨: brew install --cask ollama"
+if ! command -v ollama >/dev/null 2>&1; then
+  if [ "$OS" = "Darwin" ]; then
+    warn "ollama 未検出。公式アプリ推奨: brew install --cask ollama"
+  else
+    warn "ollama 未検出。Linux: curl -fsSL https://ollama.com/install.sh | sh"
+  fi
+fi
 command -v claude >/dev/null 2>&1 || warn "claude (Claude Code) 未検出: https://claude.com/claude-code"
-command -v zsh    >/dev/null 2>&1 || warn "zsh 未検出（localclaude の実行に必要）"
 
 # ── uv（ollama-manager の実行に必要）─ 無ければ導入を尋ねる ──────
 if command -v uv >/dev/null 2>&1; then

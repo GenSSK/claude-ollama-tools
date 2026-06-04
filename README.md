@@ -1,6 +1,6 @@
 # claude-ollama-tools
 
-ローカルの [Ollama](https://ollama.com) で [Claude Code](https://claude.com/claude-code) を動かし、モデルを管理するための macOS 向けコマンド集です。
+ローカルの [Ollama](https://ollama.com) で [Claude Code](https://claude.com/claude-code) を動かし、モデルを管理するための **macOS / Linux** 向けコマンド集です（Windows は WSL 経由で Linux として動作）。
 
 - **`localclaude`** — Ollama のローカルモデルで Claude Code を起動するラッパー。起動時にモデルを warm ロードし、終了時に自動で offload します。
 - **`ollama-manager`** — Ollama モデルを管理する TUI（一覧 / ダウンロード / 削除 / context 長変更 / unload / 詳細）。
@@ -12,8 +12,8 @@
 
 | | 用途 |
 |---|---|
-| macOS | Apple Silicon で動作確認（M5 Pro / 64GB） |
-| [Ollama](https://ollama.com) | **公式アプリ版を推奨**。Homebrew の formula 版はランナー `llama-server` を欠き推論できない場合があります（`brew install --cask ollama`） |
+| OS | macOS（Apple Silicon で動作確認）/ Linux（bash 3.2+）。Windows は未対応（WSL なら Linux として動作） |
+| [Ollama](https://ollama.com) | macOS: 公式アプリ版推奨 `brew install --cask ollama`（formula 版はランナー `llama-server` を欠くことあり）。Linux: `curl -fsSL https://ollama.com/install.sh \| sh` |
 | [Claude Code](https://claude.com/claude-code) | `claude` コマンド |
 | [uv](https://docs.astral.sh/uv/) | `ollama-manager` の実行に必要（依存は初回に自動取得） |
 
@@ -73,7 +73,7 @@ localclaude --host 192.168.2.31        # 別マシン(LAN)の Ollama を使う
 
 ### 動作
 
-1. `ollama serve` を確認（落ちていれば公式アプリ / `brew services` で起動）
+1. `ollama serve` を確認（落ちていれば自動起動: macOS=公式アプリ/`brew services`、Linux=`ollama serve`）
 2. `--ctx` 指定時は `<base>-ctx<N>` という派生モデルを Modelfile から自動作成（既存なら再利用）
 3. ブリッジを自動判定（native か LiteLLM）
 4. モデルを warm ロード
@@ -130,13 +130,22 @@ ollama-manager --host <URL>    # 接続先（既定 $OLLAMA_HOST または http:
 効く順の対策:
 
 1. **小さめモデルを使う** — 体感に一番効きます。`qwen2.5-coder:14b` などはツール対応も強く、prefill・生成とも 2〜4 倍速。
-2. **flash attention ＋ KV キャッシュ量子化を有効化** — メモリと速度（特に長プロンプト）に効きます。Ollama 起動前に環境変数を設定して再起動します:
+2. **flash attention ＋ KV キャッシュ量子化を有効化** — メモリと速度（特に長プロンプト）に効きます。Ollama 起動前に環境変数を設定して再起動します。
+
+   macOS:
    ```sh
    launchctl setenv OLLAMA_FLASH_ATTENTION 1
    launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
    # Ollama アプリを再起動（quit → 再度起動）
    ```
    （`launchctl setenv` は OS 再起動で消えます。恒久化は LaunchAgent などで）
+
+   Linux（systemd 運用）:
+   ```sh
+   sudo systemctl edit ollama     # [Service] に Environment= で2つを追記
+   sudo systemctl restart ollama
+   ```
+   （`ollama serve` を手動起動するなら `export OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0` してから起動）
 3. **context 長を盛りすぎない** — 20 万トークン等は不要です。32k〜64k で十分で、KV キャッシュのメモリを大幅に節約できます（`localclaude --ctx <n>` や `ollama-manager` の `c`）。
 4. **プロンプトを軽くする** — 多数のスキルや大きい `CLAUDE.md` を読み込むディレクトリは prefill が増えます。軽いディレクトリで使うと速くなります。
 
